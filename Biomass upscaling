@@ -1,0 +1,294 @@
+// Define country boundary or area of interest (AOI)
+//var country_names = ['Zimbabwe']; // Specify the country of interest
+var boundary = geometry; // Load the countries FeatureCollection
+print('Boundary geometry:', boundary);
+//var boundary = countries.filter(ee.Filter.inList('country_na', country_names)).geometry(); // Extract the geometry of the specified country
+
+ 
+// Load the Planet-NICFI data
+//var nicfi = ee.ImageCollection('projects/planet-nicfi/assets/basemaps/africa'); // Access the Planet-NICFI basemaps for Africa
+var dataset = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+    .filterDate('2021-01-01', '2021-12-31')
+    .filterBounds(boundary)
+print(dataset)
+//Map.addLayer(dataset.median(),{},'TEST')
+// Applies scaling factors.
+function applyScaleFactors(image) {
+  var opticalBands = image.select('SR_B.').multiply(0.0000275).add(-0.2);
+  var thermalBands = image.select('ST_B.*').multiply(0.00341802).add(149.0);
+  return image.addBands(opticalBands, null, true)
+              .addBands(thermalBands, null, true);
+}
+
+dataset = dataset.map(applyScaleFactors);
+var firstImage = dataset.mosaic();// Filter the dataset to the specific date range and select the first image
+var nicfi_image = firstImage.clip(boundary).reproject('EPSG:4326'); // Clip the basemap to the defined boundary
+print(nicfi_image.projection(),"nicfi_image");
+
+// Compute NDVI using the Planet-NICFI image
+var ndvi = nicfi_image.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI'); // Calculate the Normalized Difference Vegetation Index (NDVI)
+
+// Add NDVI to the original NICFI image
+nicfi_image = nicfi_image.addBands(ndvi); // Add the computed NDVI as a new band to the NICFI image
+
+// Display the Planet-NICFI image
+//var vis = {"bands": ["R", "G", "B"], "min": 64, "max": 5454, "gamma": 1.8}; // Visualization parameters for RGB bands
+//Map.addLayer(nicfi_image, vis, 'Feb-May 2024 Planet-NICFI mosaic'); // Add the NICFI image layer to the map
+//Map.centerObject(boundary, 7); // Center the map on the boundary with zoom level 7
+
+// Display the NDVI image
+// var palettes = require('users/gena/packages:palettes'); // Import a palette package for visualization
+// var palette = palettes.cmocean.Delta[7]; // Select a color palette
+// var viz = {min: -1, max: 1, palette: palette}; // Visualization parameters for NDVI
+Map.addLayer(ndvi,{}, 'NDVI'); // Add the NDVI layer to the map
+
+// print(ndvi.projection());
+
+
+// Load the GEDI Level 4A dataset
+var gedi = ee.ImageCollection('LARSE/GEDI/GEDI04_A_002_MONTHLY'); // Load the GEDI Level 4A dataset
+
+// Define quality masks for filtering GEDI data
+var qualityMask = function(image) {
+  return image.updateMask(image.select('l4_quality_flag').eq(1)) // Keep data with quality flag = 1
+              .updateMask(image.select('degrade_flag').eq(0)); // Remove degraded data
+};
+
+
+// Calculates the relative standard error (RSE)
+// Pixel-wise division of the standard error (agbd_se) by the actual value (agbd)
+var errorMask = function(image) {
+  var relativeSe = image.select('agbd_se').divide(image.select('agbd')); // Calculate relative standard error
+  return image.updateMask(relativeSe.lte(0.5)); // Keep data with relative SE <= 50%
+};
+// Note: ensures that only areas with relatively low agbd uncertainty are included
+
+// Prepare slope masks
+var slopeMask = function(image) {
+  var srtm = ee.Image('USGS/SRTMGL1_003'); // Load SRTM DEM for slope calculation
+  var slope = ee.Terrain.slope(srtm); // Compute slope from DEM
+  return image.updateMask(slope.lt(30)); // Keep data for areas with slope < 30 degrees
+};
+
+
+// Process GEDI data for the defined boundary and time range
+function processGediData(boundary) {
+  var startDate = ee.Date.fromYMD(2021, 01, 1); // Start date of the analysis
+  var endDate = ee.Date.fromYMD(2021, 12, 31); // End date of the analysis
+  
+  var gediFiltered = gedi.filter(ee.Filter.date(startDate, endDate)) // Filter GEDI data by date
+                         .filter(ee.Filter.bounds(boundary)); // Filter GEDI data by boundary
+  
+
+  var gediProjection = ee.Image(gediFiltered.first()).select('agbd').reproject({
+  crs: 'EPSG:4326',
+  scale: 30 // Match Landsat's scale (30 meters)
+}); // Get projection of AGBD data
+  
+
+
+  var gediProcessed = gediFiltered.map(qualityMask) // Apply quality mask
+                                  .map(errorMask) // Apply error mask
+                                  .map(slopeMask); // Apply slope mask
+  
+  
+
+  var gediMosaic1 = gediProcessed.mosaic().select('agbd').setDefaultProjection('EPSG:4326');
+  print(boundary.projection(),"boundary");
+  print(gediMosaic1.projection(),"gediMosaic1");
+  
+  var gediMosaic = gediMosaic1.clip(boundary); // Clip the mosaic to the boundary
+  
+  var gediVis = {
+    min: 1,
+    max: 2000,
+    palette: ['red', 'green', 'blue'], // Visualization parameters for AGBD
+  };
+  
+  Map.addLayer(gediMosaic, gediVis, 'GEDI L4A Mean AGBD'); // Add GEDI AGBD layer to the map
+  
+  var ta_points = gediMosaic.sample({
+    region: boundary,
+    scale: 100, // Sampling scale in meters
+    geometries: true, // Include geometries in the sampled points
+    seed: 42 // Seed for reproducibility
+  });
+  
+  return ta_points;
+}
+
+var ta_points = processGediData(boundary); // Process GEDI data for the boundary
+// ta_points = ta_points.filter(ee.Filter.and(ee.Filter.gte('agbd', 0), ee.Filter.lte('agbd', 90))); // Filter AGBD values within a specific range
+
+print(ta_points);
+
+// Import ESA land cover data
+var esaLandCover = ee.Image('ESA/WorldCover/v100/2020')
+                    .select('Map'); // Select the 'Map' band representing land cover classes
+
+// Define land cover classes for Tree Cover (10) and Shrubland (20)
+var landCoverMask = esaLandCover.eq(10).or(esaLandCover.eq(20)); // Mask to include only these classes
+
+// Apply the land cover mask to the Planet-NICFI image
+var maskedNicfiImage = nicfi_image.updateMask(landCoverMask); // Filter NICFI data to Tree Cover and Shrubland areas
+// Extract land cover type for each point in ta_points
+var pointsWithLandCover = esaLandCover.reduceRegions({
+  collection: ta_points, // Input point collection
+  reducer: ee.Reducer.first(), // Assign the land cover type to each point
+  scale: 100 // Sampling resolution in meters
+});
+
+// Filter points to include only those in Tree Cover and Shrubland
+var filteredPoints = pointsWithLandCover.filter(ee.Filter.inList('first', [10, 20])); // Include points in the specified classes
+
+// Update training and testing samples with the filtered points
+var filteredSample = filteredPoints.randomColumn('random'); // Add a random column for splitting
+var split = 0.7; // Split ratio for training and testing
+var trainingSample = filteredSample.filter(ee.Filter.lt('random', split)); // Training data
+var testSample = filteredSample.filter(ee.Filter.gte('random', split)).limit(5000); // Testing data
+// Predictor variables and target variable
+var bands = ['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'NDVI']; // Predictor variables
+var variables = bands;
+var label = 'agbd'; // Response variable
+
+// Train a random forest model on filtered points
+var model = ee.Classifier.smileRandomForest({
+  numberOfTrees: 500 // Define the number of trees
+}).setOutputMode('REGRESSION').train({
+  features: maskedNicfiImage.sampleRegions({
+    collection: trainingSample, // Use filtered training points
+    scale: 100, // Scale for sampling
+    properties: [label], // Include the target variable
+    geometries: true
+  }),
+  classProperty: label, // Target variable
+  inputProperties: variables // Predictor variables
+});
+// Predict aboveground biomass using the trained model
+var agbdPrediction = maskedNicfiImage.select(bands).classify(model).rename('AGBD_Prediction');
+  // Load and define a continuous palette
+var palettes = require('users/gena/packages:palettes');
+
+// Choose and define a palette
+var palette = palettes.colorbrewer.YlGn[5];
+// Display the input imagery and the regression classification.
+// Assume `regression` is the AGBD prediction image from your model
+var regressionMin = agbdPrediction.reduceRegion({
+  reducer: ee.Reducer.min(),
+  scale: 100,
+  geometry: boundary,
+  bestEffort: true,
+  tileScale: 5
+}).getNumber('AGBD_Prediction');
+
+// Visualization parameters
+var regressionMax = agbdPrediction.reduceRegion({
+  reducer: ee.Reducer.max(),
+  scale: 100,
+  geometry: boundary,
+  bestEffort: true,
+  tileScale: 5
+}).getNumber('AGBD_Prediction');
+
+// Visualization parameters
+var viz = {
+  palette: palette,
+  min: regressionMin.getInfo(), // Convert server-side object to client-side
+  max: regressionMax.getInfo()  // Convert server-side object to client-side
+};
+
+// Add the AGBD map layer
+Map.addLayer(agbdPrediction, viz, 'AGBD Map');
+// Create the panel for the legend items
+var legend = ui.Panel({
+  style: {
+    position: 'bottom-right',
+    padding: '8px 15px'
+  }
+});
+// Create and add the legend title
+var legendTitle = ui.Label({
+  value: 'Mean AGBD (Mg/ha)',
+  style: {
+    fontWeight: 'bold',
+    fontSize: '18px',
+    margin: '0 0 4px 0',
+    padding: '0'
+  }
+});
+
+legend.add(legendTitle);
+// Create the legend gradient image
+var lon = ee.Image.pixelLonLat().select('latitude');
+var gradient = lon.multiply((viz.max - viz.min) / 100.0).add(viz.min);
+var legendImage = gradient.visualize(viz);
+// Create a panel for the max value label
+var maxLabel = ui.Panel({
+  widgets: [ui.Label(viz.max.toFixed(2).toString())], // Format to 2 decimal places
+  style: {margin: '4px 8px'}
+});
+legend.add(maxLabel);
+
+// Create a thumbnail from the legend gradient image
+var thumbnail = ui.Thumbnail({
+  image: legendImage,
+  params: {bbox: '0,0,10,100', dimensions: '10x200'}, // Dimensions of the gradient
+  style: {padding: '1px', position: 'bottom-center'}
+});
+legend.add(thumbnail);
+
+// Create a panel for the min value label
+var minLabel = ui.Panel({
+  widgets: [ui.Label(viz.min.toFixed(2).toString())], // Format to 2 decimal places
+  style: {margin: '4px 8px'}
+});
+legend.add(minLabel);
+
+// Add the legend to the map
+Map.add(legend);
+
+// Validation: Sample predicted and observed data for calculating RMSE and R²
+var validation = agbdPrediction.sampleRegions({
+  collection: testSample, // Use test samples for validation
+  properties: [label], // Include observed AGBD values
+  scale: 30 // Scale for sampling
+});
+
+// Extract observed and predicted values
+var observed = validation.aggregate_array(label); // Observed values (ground truth)
+var predicted = validation.aggregate_array('AGBD_Prediction'); // Predicted values
+
+// Calculate RMSE
+var rmse = observed.zip(predicted).map(function(pair) {
+  pair = ee.List(pair);
+  var obs = ee.Number(pair.get(0)); // Observed value
+  var pred = ee.Number(pair.get(1)); // Predicted value
+  return obs.subtract(pred).pow(2); // Squared difference
+});
+var mse = ee.Array(rmse).reduce(ee.Reducer.mean(), [0]).get([0]); // Mean squared error
+var rmseResult = ee.Number(mse).sqrt(); // Root mean squared error
+
+// Calculate R²
+var meanObserved = observed.reduce(ee.Reducer.mean());
+var ssTot = observed.map(function(obs) {
+  return ee.Number(obs).subtract(meanObserved).pow(2); // Total sum of squares
+}).reduce(ee.Reducer.sum());
+var ssRes = rmse.reduce(ee.Reducer.sum()); // Residual sum of squares
+var rSquared = ee.Number(1).subtract(ee.Number(ssRes).divide(ssTot)); // Coefficient of determination
+
+// Print RMSE and R² metrics
+print('RMSE:', rmseResult);
+print('R²:', rSquared);
+
+// Export the predicted AGBD map for the Tree Cover and Shrubland areas
+Export.image.toDrive({
+  image: agbdPrediction, // Image to export
+  description: 'Zim_Tree_Shrub_AGBD_Prediction', // Description of the export
+  //assetId: 'projects/ee-kamusoko-test/assets/Zim_Tree_Shrub_AGBD_Prediction', // Asset ID
+  region: boundary, // Define the export region
+  scale: 30, // Scale in meters
+  maxPixels: 1e13 // Maximum allowed pixels
+});
+
+
+
